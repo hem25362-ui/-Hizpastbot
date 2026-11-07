@@ -1,0 +1,1650 @@
+# -*- coding: utf-8 -*-
+# ─────────────────────────────────────────────────────────────────────────────
+#  ВСЁ В ОДНОМ ФАЙЛЕ.  Ничего настраивать не нужно.
+#
+#  Токен бота, ключ xRocket, почты, админы и цены уже вписаны внутри.
+#  Положи файл в папку и запусти:   python hizorysnoser_all.py
+#  Поставь пакеты:                  pip install python-telegram-bot
+#
+#  Если рядом положишь .env — значения из него перекроют вписанные,
+#  но для работы это не обязательно.
+#
+#  ⚠️ В файле живые секреты: кто получит файл, получит и бота с кабинетом
+#  xRocket. Не выкладывай его в открытые репозитории и чаты.
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""hizorysnoser v3 — жалобы на страницы, подписки через xRocket, админка.
+
+Запуск:
+    pip install python-telegram-bot==21.*
+    export BOT_TOKEN=...            # токен бота от @BotFather
+    export XROCKET_TOKEN=...        # API Token приложения в xRocket Pay
+    export EMAIL_1=... EMAIL_PASS_1=... EMAIL_2=... EMAIL_PASS_2=...
+    python hizory_v3.py
+
+Необязательно:
+    XROCKET_CURRENCY=USDT    валюта счёта (по умолчанию USDT)
+    FREE_MODE=0              включить проверку подписки (по умолчанию выключена)
+    DATA_FILE=data.json      файл с пользователями и платежами
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import smtplib
+import ssl
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+HTML = ParseMode.HTML
+
+# ================= НАСТРОЙКИ =================
+def _load_env() -> None:
+    """Читает .env рядом с файлом. Уже заданные переменные окружения не трогает."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(here, ".env"), "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key and value and key not in os.environ:
+                    os.environ[key] = value
+    except FileNotFoundError:
+        pass
+
+
+# .env читается только по явному флагу. Иначе старый файл, лежащий рядом,
+# перебивает токены из кода, и оплата отваливается с 401 unauthorized.
+if os.getenv("USE_ENV_FILE") == "1":
+    _load_env()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9157854502:AAH3iN5ewDEqqPlJlZQBjgjAfG35KmbNGC4")
+XROCKET_TOKEN = os.getenv("XROCKET_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcHBJZCI6IjMwODI3NSIsImp0aSI6ImFwcDozMDgyNzU6M2UxZTU2MGQtYWI1MC00OTBmLWE5ZTctZDUwNjA0OTQ4ZTJjIiwiaWF0IjoxNzk0MDE2NTQ2fQ.OZ4YMqZz_uC4GZNxf5YBs6MJ3m8LEuG0lT_Nq0Gu6aA")
+XR_BASE = os.getenv("XROCKET_API", "https://pay.api.xrocket.exchange")
+XR_CURRENCY = os.getenv("XROCKET_CURRENCY", "USDT")
+PAY_BOT_URL = os.getenv("PAY_BOT_URL", "https://t.me/Hizpastbot")
+SUPPORT = "@Job_Van"
+
+ADMIN_IDS = {1925084785}  # единственный владелец/админ бота
+DATA_FILE = os.getenv("DATA_FILE", "data.json")
+FREE_MODE = os.getenv("FREE_MODE", "0") == "1"
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
+ABUSE_EMAIL = "abuse@telegram.org"
+
+ACCOUNTS = [
+    {"email": os.getenv("EMAIL_1", "hizory4@gmail.com"), "password": os.getenv("EMAIL_PASS_1", "apqjhbqjnxojtgnz")},
+    {"email": os.getenv("EMAIL_2", "rufers17@gmail.com"), "password": os.getenv("EMAIL_PASS_2", "tdretqdxluzzhihk")},
+]
+
+COOLDOWN = 60.0     # секунд между жалобами одного человека
+GAP = 3.0           # пауза между ящиками внутри одной жалобы
+RATE_TTL = 3 * 3600  # как часто обновлять курс
+XR_UA = "xRocket-Pay-Bot/1.0 (+https://t.me/Hizpastbot)"  # без UA Cloudflare отдаёт 403
+PAID_STATES = {"paid", "completed", "success"}
+FOREVER_TS = 4102444800  # 2100-01-01, «навсегда»
+
+TG_HOSTS = ("t.me", "telegram.me", "telegram.dog", "tlgg.ru")
+PH_HOSTS = ("telegra.ph", "graph.org")
+ALLOWED_HOSTS = TG_HOSTS + PH_HOSTS
+URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+HANDLE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+PH_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,120}$")
+INVITE_RE = re.compile(r"^\+[A-Za-z0-9_-]{8,64}$")
+JOINCHAT_RE = re.compile(r"^joinchat/[A-Za-z0-9_-]{8,64}$", re.IGNORECASE)
+PRIVATE_RE = re.compile(r"^c/\d{5,20}(/\d+)?$", re.IGNORECASE)
+# любой похожий на ссылку кусок внутри текста
+LINK_TOKEN_RE = re.compile(
+    r"(?:https?://|tg://)[^\s<>«»\"']+"
+    r"|(?:t|telegram)\.me/[^\s<>«»\"']+"
+    r"|(?:telegra\.ph|graph\.org)/[^\s<>«»\"']+"
+    r"|@[A-Za-z0-9_]{3,32}",
+    re.IGNORECASE,
+)
+TG_ID_RE = re.compile(r"^\d{5,15}$")
+
+# ================= ТАРИФЫ =================
+# цены подобраны так, чтобы цена за день падала плавно: 100 → 80 → 70 → 33
+PLANS = {
+    "day": {"label": "1 день", "days": 1, "rub": 100, "note": "24 часа, все 10 методов"},
+    "d3": {"label": "3 дня", "days": 3, "rub": 250, "note": "трое суток, без ограничений"},
+    "week": {"label": "7 дней", "days": 7, "rub": 500, "note": "неделя, приоритет в очереди"},
+    "month": {"label": "30 дней", "days": 30, "rub": 650, "note": "месяц, самый выгодный срок"},
+    "forever": {"label": "навсегда", "days": None, "rub": 1000, "note": "один платёж, без продлений"},
+}
+PLAN_ORDER = ["day", "d3", "week", "month", "forever"]
+
+# ================= ДОНАТ =================
+DONATE_CODE = "donate"
+DONATE_PRESETS = (1, 3, 5, 10)   # быстрые суммы в долларах
+DONATE_MIN, DONATE_MAX = 0.1, 10000.0
+
+
+def plan_label(code: str) -> str:
+    """Название тарифа; для доната — своё."""
+    if code == DONATE_CODE:
+        return "донат"
+    return PLANS.get(code, {}).get("label", code)
+
+# ================= МЕТОДЫ =================
+METHODS = {
+    "scam": {
+        "emoji": "💸",
+        "label": "Мошенничество",
+        "subject": "Report: fraud and scam",
+        "body": """Hello,
+
+The reported account runs a scam and takes money from people under false pretences.
+
+URL: {url}
+What it contains: {details}
+
+This violates the Terms of Service and fraud and consumer protection law in most jurisdictions.
+Please remove it and take action against the owners.
+
+Thank you.""",
+    },
+    "phishing": {
+        "emoji": "🎣",
+        "label": "Фишинг",
+        "subject": "Report: phishing and credential theft",
+        "body": """Hello,
+
+The reported account collects logins, passwords and Telegram codes under a fake pretext.
+
+URL: {url}
+What it contains: {details}
+
+This is phishing: it is used to hijack accounts and steal money, and it violates the Terms of Service.
+Please remove it and block the domain it uses.
+
+Thank you.""",
+    },
+    "drugs": {
+        "emoji": "🧪",
+        "label": "Наркотики",
+        "subject": "Report: illegal drug sales and distribution",
+        "body": """Hello,
+
+The reported account sells and distributes illegal drugs.
+
+URL: {url}
+What it contains: {details}
+
+This promotes and facilitates illegal drug transactions, which violates the Terms of Service and the law of most jurisdictions.
+Please remove it and take action against the owners.
+
+Thank you.""",
+    },
+    "csam": {
+        "emoji": "🛑",
+        "label": "Детская порнография",
+        "subject": "Report: child sexual abuse material (CSAM)",
+        "body": """Hello,
+
+The reported account contains or distributes child sexual abuse material.
+
+URL: {url}
+What it contains: {details}
+
+This is illegal content involving the sexual exploitation of minors. It violates the Terms of Service, the EU Digital Services Act and criminal law worldwide.
+Please remove it immediately and refer it to the relevant authorities.
+
+Thank you.""",
+    },
+    "dox": {
+        "emoji": "🪪",
+        "label": "Личные данные",
+        "subject": "Report: personal data published without consent",
+        "body": """Hello,
+
+The reported account publishes personal data without consent: full name, address, phone number, documents and other private information.
+
+URL: {url}
+What it contains: {details}
+
+This exposes a private person to harm and violates the GDPR (Regulation (EU) 2016/679), the Digital Services Act (Regulation (EU) 2022/2065) and the Terms of Service.
+Please remove it.
+
+Thank you.""",
+    },
+
+}
+
+TARGETS = {
+    "bot": {"emoji": "🤖", "label": "Бот", "word": "bot", "acc": "бота",
+            "about": "бот, который обманывает, собирает данные или рассылает спам"},
+    "channel": {"emoji": "📢", "label": "Канал", "word": "channel", "acc": "канал",
+                "about": "канал с обманом, фишингом или запрещённым контентом"},
+    "group": {"emoji": "👥", "label": "Группа", "word": "group", "acc": "группу",
+              "about": "группа, где торгуют обманом или ведут запрещённые схемы"},
+    "page": {"emoji": "🌐", "label": "Страница", "word": "page", "acc": "страницу",
+             "about": "страница telegra.ph или graph.org с нарушением"},
+}
+
+METHOD_ORDER = ["scam", "phishing", "csam", "drugs", "dox"]
+
+# ================= ХРАНИЛИЩЕ =================
+DATA: dict = {"users": {}, "payments": []}
+
+
+def load_data() -> None:
+    global DATA
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            DATA["users"] = raw.get("users", {}) or {}
+            DATA["payments"] = raw.get("payments", []) or []
+    except (OSError, ValueError):
+        DATA = {"users": {}, "payments": []}
+
+
+def save_data() -> None:
+    tmp = DATA_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(DATA, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, DATA_FILE)
+    except OSError:
+        pass
+
+
+def user_rec(uid: int) -> dict:
+    key = str(uid)
+    users = DATA["users"]
+    if key not in users:
+        users[key] = {
+            "id": uid,
+            "name": "",
+            "username": "",
+            "first": int(time.time()),
+            "reports": 0,
+            "last_at": 0,
+            "sub_until": 0,
+            "sub_plan": "",
+        }
+    return users[key]
+
+
+def touch_user(user) -> dict:
+    rec = user_rec(getattr(user, "id", 0))
+    rec["name"] = getattr(user, "first_name", "") or rec.get("name", "")
+    rec["username"] = getattr(user, "username", "") or rec.get("username", "")
+    return rec
+
+
+# ================= КУРС =================
+RATE = {"usd_rub": 0.0, "at": 0, "source": ""}
+
+
+def _fetch_rate() -> tuple[float, str]:
+    url = "https://www.cbr-xml-daily.ru/daily_json.js"
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        payload = json.loads(r.read().decode("utf-8", "replace"))
+    value = float(payload["Valute"]["USD"]["Value"])
+    if value <= 0:
+        raise ValueError("курс нулевой")
+    return value, "ЦБ РФ"
+
+
+def _fetch_rate_sync() -> tuple[float, str]:
+    try:
+        return _fetch_rate()
+    except Exception:
+        return 0.0, ""
+
+
+async def usd_rate() -> float:
+    now = time.time()
+    if RATE["usd_rub"] and now - RATE["at"] < RATE_TTL:
+        return RATE["usd_rub"]
+    value, source = await asyncio.to_thread(_fetch_rate_sync)
+    if value:
+        RATE.update({"usd_rub": value, "at": now, "source": source})
+        return value
+    if RATE["usd_rub"]:
+        return RATE["usd_rub"]
+    RATE.update({"usd_rub": 81.5, "at": now, "source": "запасной"})
+    return 81.5
+
+
+def usd_of(rub: int, rate: float) -> float:
+    return round(rub / rate, 2) if rate else 0.0
+
+
+def rub_str(value: int) -> str:
+    return f"{value:,}".replace(",", " ") + " ₽"
+
+
+# ================= ПОДПИСКА =================
+def sub_left(uid: int) -> int:
+    rec = DATA["users"].get(str(uid))
+    if not rec:
+        return 0
+    left = int(rec.get("sub_until", 0)) - int(time.time())
+    return left if left > 0 else 0
+
+
+def has_access(uid: int) -> bool:
+    """Доступ: у админов он есть всегда, остальным нужна подписка."""
+    if int(uid) in ADMIN_IDS:
+        return True
+    return FREE_MODE or sub_left(uid) > 0
+
+
+def grant(uid: int, code: str) -> int:
+    plan = PLANS.get(code)
+    if plan is None:
+        return 0
+    rec = user_rec(uid)
+    base = max(int(time.time()), int(rec.get("sub_until", 0)))
+    if plan["days"] is None:
+        rec["sub_until"] = FOREVER_TS
+    else:
+        rec["sub_until"] = base + plan["days"] * 86400
+    rec["sub_plan"] = code
+    save_data()
+    return rec["sub_until"]
+
+
+def revoke(uid: int) -> None:
+    rec = user_rec(uid)
+    rec["sub_until"] = 0
+    rec["sub_plan"] = ""
+    save_data()
+
+
+def sub_line(uid: int) -> str:
+    left = sub_left(uid)
+    if not left:
+        return "подписки нет"
+    if left > 30 * 86400 * 365:
+        return "навсегда"
+    days, rem = divmod(left, 86400)
+    hours = rem // 3600
+    if days:
+        return f"ещё {days} дн. {hours} ч."
+    return f"ещё {hours} ч."
+
+
+# ================= xROCKET =================
+def _xr_call(method: str, path: str, payload: dict | None = None) -> tuple[dict, str]:
+    url = XR_BASE + path
+    headers = {"Accept": "application/json", "User-Agent": XR_UA}
+    if XROCKET_TOKEN:
+        headers["Authorization"] = "Bearer " + XROCKET_TOKEN
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        return json.loads(raw or "{}"), ""
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:400]
+        return {}, f"HTTP {exc.code}: {detail}"
+    except Exception as exc:  # сеть, таймаут, кривой JSON
+        return {}, f"{type(exc).__name__}: {exc}"
+
+
+async def xr_create(uid: int, code: str, amount: float, title: str) -> tuple[str, int, str]:
+    """Создаёт счёт, возвращает (ссылка, id, ошибка)."""
+    if not XROCKET_TOKEN:
+        return "", 0, "XROCKET_TOKEN не задан"
+    payload = {
+        "priceAmount": f"{amount:.2f}",
+        "priceCurrency": XR_CURRENCY,
+        "numPayments": 1,
+        "description": f"PsyhoSn · {title} · id {uid}"[:1000],
+        "expiresIn": 86400 * 1000,
+        "clientInvoiceId": f"{uid}-{code}-{int(time.time())}-{uuid.uuid4().hex[:8]}",
+        "data": {"uid": str(uid), "plan": code},
+    }
+    data, err = await asyncio.to_thread(_xr_call, "POST", "/api/v1/invoices", payload)
+    if err:
+        return "", 0, err
+    item = data.get("data") or data
+    link = (item.get("links") or {}).get("telegramBotLink") or item.get("link") or ""
+    try:
+        inv_id = int(item.get("id") or 0)
+    except (TypeError, ValueError):
+        inv_id = 0
+    if not link or not inv_id:
+        return "", 0, f"в ответе нет ссылки: {str(item)[:200]}"
+    return link, inv_id, ""
+
+
+async def xr_status(inv_id: int) -> tuple[str, str]:
+    data, err = await asyncio.to_thread(
+        _xr_call, "GET", f"/api/v1/invoice?invoiceId={int(inv_id)}", None
+    )
+    if err:
+        return "", err
+    item = data.get("data") or data
+    return str(item.get("status") or ""), ""
+
+
+def payment_add(uid: int, code: str, rub: int, usd: float, inv_id: int, link: str) -> dict:
+    item = {
+        "uid": uid,
+        "plan": code,
+        "rub": rub,
+        "usd": usd,
+        "invoice": inv_id,
+        "link": link,
+        "status": "active",
+        "at": int(time.time()),
+    }
+    DATA["payments"].append(item)
+    DATA["payments"] = DATA["payments"][-200:]
+    save_data()
+    return item
+
+
+def payment_find_invoice(inv_id: int) -> dict | None:
+    for item in reversed(DATA["payments"]):
+        if int(item.get("invoice") or 0) == int(inv_id):
+            return item
+    return None
+
+
+# ================= ПИСЬМА =================
+def accounts() -> list[dict]:
+    return [a for a in ACCOUNTS if a.get("email") and a.get("password")]
+
+
+def _split(cand: str) -> tuple[str, str]:
+    """Домен и путь. Схема необязательна, www. и хвост с ?# отбрасываются."""
+    parts = urllib.parse.urlsplit(cand if "//" in cand else "https://" + cand)
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = urllib.parse.unquote(parts.path or "").strip("/")
+    return host, path
+
+
+def _tg(path: str, target: str) -> tuple[str, str]:
+    if not path:
+        return "", "Это только домен. Пример: t.me/name или @name"
+    if target == "page":
+        return "", "Для страницы нужна ссылка telegra.ph или graph.org"
+    first = path.split("/")[0]
+    ok = (
+        HANDLE_RE.match(first)
+        or INVITE_RE.match(first)
+        or JOINCHAT_RE.match(path)
+        or PRIVATE_RE.match(path)
+    )
+    if not ok:
+        return "", "Имя в ссылке не телеграмное: 4–32 символа, латиница, цифры и _"
+    return "https://t.me/" + path, ""
+
+
+def _ph(host: str, path: str, target: str) -> tuple[str, str]:
+    if not path:
+        return "", "Это только домен. Пример: telegra.ph/Some-Page-11-05"
+    if not PH_SLUG_RE.match(path):
+        return "", "В ссылке нет названия страницы"
+    if target and target != "page":
+        return "", "Для бота, канала и группы нужна ссылка t.me"
+    return f"https://{host}/{path}", ""
+
+
+def validate_url(text: str, target: str = "") -> tuple[str, str]:
+    """Принимает t.me/name, https://t.me/name, @name, name, tg://…, telegra.ph/…"""
+    raw = (text or "").strip().strip("<>«»\"'` \t\r\n")
+    if not raw:
+        return "", "Пустая ссылка."
+
+    # tg://resolve?domain=name
+    if raw.lower().startswith("tg://"):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(raw).query)
+        domain = (q.get("domain") or [""])[0].strip()
+        if not domain:
+            return "", "В tg:// нет имени. Пример: t.me/name"
+        raw = "@" + domain
+        if not HANDLE_RE.match(domain):
+            return "", "Имя в ссылке не телеграмное: 4–32 символа, латиница, цифры и _"
+
+    # вокруг ссылки мог быть текст — берём первый похожий кусок
+    if not (
+        raw.lower().startswith(("http://", "https://", "@"))
+        or _split(raw)[0] in ALLOWED_HOSTS
+        or HANDLE_RE.match(raw)
+    ):
+        found = LINK_TOKEN_RE.search(raw)
+        if not found:
+            return "", "Не разобрал ссылку. Пример: t.me/name или @name"
+        raw = found.group(0).strip(".,;:!?)»\"'")
+
+    if raw.startswith("@"):
+        name = raw[1:].strip("/")
+        if not HANDLE_RE.match(name):
+            return "", "Имя в ссылке не телеграмное: 4–32 символа, латиница, цифры и _"
+        return _tg(name, target)
+
+    host, path = _split(raw)
+    if host in TG_HOSTS:
+        return _tg(path, target)
+    if host in PH_HOSTS:
+        return _ph(host, path, target)
+    if not path and HANDLE_RE.match(raw):
+        return _tg(raw, target)
+    return "", "Принимаю t.me, telegram.me, telegra.ph и graph.org"
+
+
+def details_line(details: str) -> str:
+    text = (details or "").strip()
+    if not text:
+        return "described in the link below"
+    return " ".join(text.split())[:600]
+
+
+def build_letter(
+    method_key: str, url: str, details: str, target_key: str = "page"
+) -> tuple[str, str]:
+    method = METHODS[method_key]
+    target = TARGETS.get(target_key, TARGETS["page"])
+    body = method["body"].format(url=url, details=details_line(details))
+    body = body.replace(
+        "Hello,\n\n", f"Hello,\n\nI am reporting a Telegram {target['word']}.\n\n", 1
+    )
+    return f"{method['subject']} ({target['word']})", body
+
+
+def _send_one(account: dict, subject: str, body: str) -> str:
+    msg = EmailMessage()
+    msg["From"] = account["email"]
+    msg["To"] = ABUSE_EMAIL
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=account["email"].split("@")[-1])
+    msg.set_content(body)
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=25) as smtp:
+        smtp.login(account["email"], account["password"])
+        smtp.send_message(msg)
+    return account["email"]
+
+
+def send_letters(subject: str, body: str) -> tuple[int, list[str]]:
+    sent = 0
+    errors: list[str] = []
+    boxes = accounts()
+    for index, account in enumerate(boxes):
+        try:
+            _send_one(account, subject, body)
+            sent += 1
+        except smtplib.SMTPAuthenticationError:
+            errors.append("не пустило по паролю приложения — перевыпусти пароль Gmail")
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}"[:200])
+        if index < len(boxes) - 1:
+            time.sleep(GAP)
+    return sent, errors
+
+
+def bump_reports(uid: int, method_key: str) -> None:
+    rec = user_rec(uid)
+    rec["reports"] = int(rec.get("reports", 0)) + 1
+    rec["last_at"] = int(time.time())
+    rec["last_method"] = method_key
+    save_data()
+
+
+# ================= КЛАВИАТУРЫ =================
+def kb_main(uid: int = 0) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("▶️ Начать жалобу", callback_data="m:start")],
+        [
+            InlineKeyboardButton("💳 Подписка", callback_data="m:shop"),
+            InlineKeyboardButton("👤 Профиль", callback_data="m:profile"),
+        ],
+    ]
+    if int(uid) in ADMIN_IDS:
+        rows.append([InlineKeyboardButton("🛠 Админка", callback_data="a:stats")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_route() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📧 Почта", callback_data="m:mail"),
+                InlineKeyboardButton("🌐 Telegra.ph", callback_data="m:ph"),
+            ],
+            [InlineKeyboardButton("‹ В меню", callback_data="m:menu")],
+        ]
+    )
+
+
+def kb_targets() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🤖 Бот", callback_data="m:t_bot"),
+                InlineKeyboardButton("📢 Канал", callback_data="m:t_channel"),
+            ],
+            [InlineKeyboardButton("👥 Группа", callback_data="m:t_group")],
+            [InlineKeyboardButton("‹ Назад", callback_data="m:start")],
+        ]
+    )
+
+
+def kb_methods() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for key in METHOD_ORDER:
+        m = METHODS[key]
+        btn = InlineKeyboardButton(f"{m['emoji']} {m['label']}", callback_data=f"c:{key}")
+        if row and len(row[0].text) + len(btn.text) + 3 > 33:
+            rows.append(row)
+            row = []
+        row.append(btn)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("‹ В меню", callback_data="m:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_back_to(target: str, label: str = "‹ Назад") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
+
+
+def kb_details(method_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Пропустить", callback_data="x:skip")],
+            [InlineKeyboardButton("‹ Другой метод", callback_data="m:methods")],
+        ]
+    )
+
+
+def kb_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Отправить", callback_data="x:send")],
+            [InlineKeyboardButton("✏️ Изменить ссылку", callback_data="m:start")],
+            [InlineKeyboardButton("✖️ Отмена", callback_data="x:cancel")],
+        ]
+    )
+
+
+def kb_after_send() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔁 Ещё жалоба", callback_data="m:start")],
+            [InlineKeyboardButton("‹ В меню", callback_data="m:menu")],
+        ]
+    )
+
+
+def kb_shop() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎫 Мои подписки", callback_data="m:profile")],
+        [InlineKeyboardButton("‹ В меню", callback_data="m:menu")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_admin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 Статистика", callback_data="a:stats")],
+            [InlineKeyboardButton("👥 Пользователи", callback_data="a:users")],
+            [InlineKeyboardButton("🎁 Выдать", callback_data="a:grant"),
+             InlineKeyboardButton("🚫 Забрать", callback_data="a:revoke")],
+            [InlineKeyboardButton("🧾 Платежи", callback_data="a:pays")],
+            [InlineKeyboardButton("📣 Рассылка", callback_data="a:cast")],
+            [InlineKeyboardButton("‹ В меню", callback_data="m:menu")],
+        ]
+    )
+
+
+def kb_plans(rate: float) -> InlineKeyboardMarkup:
+    rows = []
+    for code in PLAN_ORDER:
+        plan = PLANS[code]
+        usd = usd_of(plan["rub"], rate)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    f"{plan['label']} · {rub_str(plan['rub'])} · ${usd:.2f}",
+                    callback_data=f"b:{code}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton("‹ В меню", callback_data="m:menu")])
+    return InlineKeyboardMarkup(rows)
+
+
+def kb_invoice(link: str, inv_id: int, back: str = "m:shop", back_label: str = "‹ В магазин") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🛰 Открыть счёт", url=link)],
+            [InlineKeyboardButton("🔄 Я оплатил", callback_data=f"p:{inv_id}")],
+            [InlineKeyboardButton(back_label, callback_data=back)],
+        ]
+    )
+
+
+def kb_profile() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("❤️ Пожертвовать", callback_data="d:menu")],
+            [InlineKeyboardButton("‹ В меню", callback_data="m:menu")],
+        ]
+    )
+
+
+def kb_donate() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for amount in DONATE_PRESETS:
+        row.append(InlineKeyboardButton(f"${amount}", callback_data=f"d:{amount}"))
+    rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Своя сумма", callback_data="d:custom")])
+    rows.append([InlineKeyboardButton("‹ В профиль", callback_data="m:profile")])
+    return InlineKeyboardMarkup(rows)
+
+
+# ================= ЭКРАНЫ =================
+def text_main(rate: float, uid: int = 0) -> str:
+    """Главный экран: короткая карточка, доступ и счётчик жалоб."""
+    lines = [
+        "🛡 <b>Hizpastbot</b>",
+        "<i>жалобы на нарушителей</i>",
+        "",
+        f"{len(METHODS)} причин · {len(TARGETS)} объекта",
+    ]
+    if uid:
+        if int(uid) in ADMIN_IDS:
+            access = "без ограничений"
+        elif left := sub_left(uid):
+            access = f"<b>{sub_line(uid)}</b>"
+        else:
+            access = "нужна подписка"
+        rec = DATA["users"].get(str(uid), {})
+        sent = int(rec.get("reports", 0))
+        lines += [
+            "",
+            f"доступ — {access}",
+            f"жалоб отправлено — <b>{sent}</b>" if sent else "жалоб пока нет",
+        ]
+    return "\n".join(lines)
+
+
+def text_route() -> str:
+    return (
+        "▶️ <b>Шаг 1 из 3</b>\n"
+        "<i>куда жалоба</i>"
+    )
+
+
+def text_targets() -> str:
+    return (
+        "📧 <b>Шаг 2 из 3</b>\n"
+        "<i>на кого</i>"
+    )
+
+
+def text_methods(target_key: str = "page") -> str:
+    t = TARGETS.get(target_key, TARGETS["page"])
+    return (
+        f"📂 <b>Шаг 3 из 3</b> · {t['emoji']} {t['label']}\n"
+        "<i>выбери метод</i>"
+    )
+
+
+def text_method(method_key: str, target_key: str = "page") -> str:
+    m = METHODS[method_key]
+    t = TARGETS.get(target_key, TARGETS["page"])
+    return (
+        f"{m['emoji']} <b>{m['label']}</b>\n"
+        f"<i>пришли ссылку на {t['acc']}</i>\n"
+        "<code>t.me/…</code> · <code>telegra.ph/…</code>"
+    )
+
+
+def text_details(method_key: str) -> str:
+    return (
+        f"{METHODS[method_key]['emoji']} <b>{METHODS[method_key]['label']}</b>\n"
+        "<i>что нарушает? можно пропустить</i>"
+    )
+
+
+def text_preview(
+    method_key: str, url: str, details: str, target_key: str = "page"
+) -> str:
+    return (
+        "🧾 <b>отправляем?</b>\n\n"
+        f"объект — <b>{TARGETS.get(target_key, TARGETS['page'])['emoji']} "
+        f"{TARGETS.get(target_key, TARGETS['page'])['label']}</b>\n"
+        f"причина — <b>{METHODS[method_key]['label']}</b>\n"
+        f"ссылка — <code>{url}</code>\n"
+        f"детали — <i>{details_line(details)}</i>"
+    )
+
+
+def text_profile(user, rate: float) -> str:
+    uid = getattr(user, "id", 0)
+    rec = touch_user(user)
+    save_data()
+    name = rec.get("name") or "без имени"
+    username = f"@{rec['username']}" if rec.get("username") else "ника нет"
+    last = rec.get("last_at") or 0
+    last_line = (
+        time.strftime("%d.%m.%Y · %H:%M", time.localtime(last)) if last else "ещё не отправлял"
+    )
+    left = sub_left(uid)
+    if left:
+        plan = PLANS.get(rec.get("sub_plan", ""), {})
+        until = time.strftime("%d.%m.%Y", time.localtime(int(rec.get("sub_until", 0))))
+        access = f"<b>{sub_line(uid)}</b> · до {until}"
+        plan_line = plan.get("label", "—")
+    elif int(uid) in ADMIN_IDS:
+        access = "без ограничений (админ)"
+        plan_line = "—"
+    else:
+        access = "подписки нет"
+        plan_line = "—"
+    sent = int(rec.get("reports", 0))
+    lines = [
+        f"👤 <b>{name}</b>",
+        f"<code>{username}</code> · id <code>{uid}</code>",
+        "",
+        f"жалоб — <b>{sent}</b>" if sent else "жалоб пока нет",
+    ]
+    if last:
+        lines.append(f"последняя — {last_line}")
+    lines += ["", f"доступ — {access}"]
+    return "\n".join(lines)
+
+
+async def text_shop(rate: float) -> str:
+    lines = ["💳 <b>Подписка</b>", ""]
+    for code in PLAN_ORDER:
+        plan = PLANS[code]
+        tail = " · выгоднее всего" if code == "month" else ""
+        lines.append(f"{plan['label']} — <b>{rub_str(plan['rub'])}</b>{tail}")
+    lines.append("")
+    lines.append(f"<i>оплата в {XR_CURRENCY} · счёт живёт сутки</i>")
+    return "\n".join(lines)
+
+
+# ---------- донат ----------
+def text_donate(rate: float = 0.0) -> str:
+    return (
+        "❤️ <b>Поддержать проект</b>\n\n"
+        "<i>Сервер и ящики живут на эти деньги.</i>\n\n"
+        f"пришли сумму в долларах — от ${DONATE_MIN:g}. "
+        "счёт придёт в {XR_CURRENCY}, оплатить можно с любого кошелька."
+    ).replace("{XR_CURRENCY}", XR_CURRENCY)
+
+
+def text_donate_invoice(usd: float, rate: float) -> str:
+    rub = int(round(usd * rate))
+    return (
+        "❤️ <b>Счёт готов</b>\n\n"
+        f"сумма — <b>${usd:.2f}</b> в {XR_CURRENCY}\n"
+        f"это около {rub_str(rub)}\n"
+        "счёт живёт сутки\n\n"
+        "<i>Оплати и нажми «Я оплатил».</i>"
+    )
+
+
+async def make_donate(uid: int, usd: float, rate: float) -> tuple[str, int, str]:
+    link, inv_id, err = await xr_create(uid, DONATE_CODE, usd, "пожертвование")
+    if not err:
+        payment_add(uid, DONATE_CODE, int(round(usd * rate)), usd, inv_id, link)
+    return link, inv_id, err
+
+
+async def on_donate(query, context, arg: str) -> None:
+    rate = await usd_rate()
+    if arg == "menu":
+        await query.answer()
+        await query.edit_message_text(
+            text_donate(rate), reply_markup=kb_donate(), parse_mode=HTML
+        )
+        return
+    if arg == "custom":
+        context.user_data["step"] = "donate"
+        await query.answer()
+        await query.edit_message_text(
+            "✏️ <b>Своя сумма</b>\n\n"
+            f"Пришли число в долларах, от ${DONATE_MIN:g}.",
+            reply_markup=kb_back_to("d:menu", "‹ Отмена"),
+            parse_mode=HTML,
+        )
+        return
+    try:
+        usd = round(float(arg.replace(",", ".")), 2)
+    except ValueError:
+        await query.answer("Не понял сумму", show_alert=True)
+        return
+    if not (DONATE_MIN <= usd <= DONATE_MAX):
+        await query.answer(f"Сумма от ${DONATE_MIN:g} до ${DONATE_MAX:g}", show_alert=True)
+        return
+    if not XROCKET_TOKEN:
+        await query.answer("Оплата не подключена: нет XROCKET_TOKEN", show_alert=True)
+        return
+    await query.answer("Создаю чек…")
+    link, inv_id, err = await make_donate(query.from_user.id, usd, rate)
+    if err:
+        await query.edit_message_text(
+            "⚠️ <b>Чек не создался</b>\n\n" f"<i>{err[:300]}</i>",
+            reply_markup=kb_back_to("d:menu", "‹ Назад"),
+            parse_mode=HTML,
+        )
+        return
+    context.user_data["step"] = "menu"
+    await query.edit_message_text(
+        text_donate_invoice(usd, rate),
+        reply_markup=kb_invoice(link, inv_id, "m:profile", "‹ В профиль"),
+        parse_mode=HTML,
+    )
+
+
+# ================= ЖАЛОБА =================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    context.user_data["step"] = "menu"
+    rate = await usd_rate()
+    touch_user(update.effective_user)
+    save_data()
+    await update.message.reply_text(
+        text_main(rate, update.effective_user.id),
+        reply_markup=kb_main(update.effective_user.id),
+        parse_mode=HTML,
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    await update.message.reply_text("Отменено. Заново: /start")
+
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        await update.message.reply_text("Команда не для тебя.")
+        return
+    rate = await usd_rate()
+    await update.message.reply_text(
+        admin_home(rate), reply_markup=kb_admin(), parse_mode=HTML
+    )
+
+
+def admin_home(rate: float) -> str:
+    active = sum(1 for u in DATA["users"].values() if int(u.get("sub_until", 0)) > time.time())
+    return (
+        "🛠 <b>Админка</b>\n\n"
+        f"пользователей — <b>{len(DATA['users'])}</b>\n"
+        f"с подпиской — <b>{active}</b>\n"
+        f"платежей — <b>{len(DATA['payments'])}</b>\n"
+        f"режим — {'бесплатно' if FREE_MODE else 'по подписке'}"
+    )
+
+
+# ---------- колбэки меню ----------
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    data = query.data or ""
+    user = query.from_user
+
+    if data.startswith("a:"):
+        if user.id not in ADMIN_IDS:
+            await query.answer("Не для тебя", show_alert=True)
+            return
+        await on_admin(query, context, data[2:])
+        return
+
+    if data.startswith("c:"):
+        await show_method(query, context, data[2:])
+        return
+    if data.startswith("x:"):
+        await on_flow(query, context, data[2:])
+        return
+    if data.startswith("b:"):
+        await on_buy(query, context, data[2:])
+        return
+    if data.startswith("p:"):
+        await on_check(query, context, data[2:])
+        return
+    if data.startswith("d:"):
+        await on_donate(query, context, data[2:])
+        return
+    if data.startswith("m:"):
+        await on_menu(query, context, data[2:], user)
+        return
+    await query.answer()
+
+
+async def on_menu(query, context, action: str, user) -> None:
+    rate = await usd_rate()
+    if action == "menu":
+        context.user_data.clear()
+        context.user_data["step"] = "menu"
+        await query.answer()
+        await query.edit_message_text(
+            text_main(rate, query.from_user.id),
+            reply_markup=kb_main(query.from_user.id),
+            parse_mode=HTML,
+        )
+        return
+
+    if action == "start":
+        if not has_access(user.id):
+            await query.answer()
+            await query.edit_message_text(
+                "🔒 Нужна подписка.\n\n" + await text_shop(rate),
+                reply_markup=kb_plans(rate),
+                parse_mode=HTML,
+            )
+            return
+        context.user_data.clear()
+        context.user_data["step"] = "route"
+        await query.answer()
+        await query.edit_message_text(text_route(), reply_markup=kb_route(), parse_mode=HTML)
+        return
+
+    if action in ("methods", "ph"):
+        if not has_access(user.id):
+            await query.answer()
+            await query.edit_message_text(
+                "🔒 Нужна подписка.\n\n" + await text_shop(rate),
+                reply_markup=kb_plans(rate),
+                parse_mode=HTML,
+            )
+            return
+        context.user_data["target"] = "page"
+        context.user_data["step"] = "method"
+        await query.answer()
+        await query.edit_message_text(
+            text_methods("page"), reply_markup=kb_methods(), parse_mode=HTML
+        )
+        return
+
+    if action == "mail":
+        if not has_access(user.id):
+            await query.answer()
+            await query.edit_message_text(
+                "🔒 Нужна подписка.\n\n" + await text_shop(rate),
+                reply_markup=kb_plans(rate),
+                parse_mode=HTML,
+            )
+            return
+        context.user_data["step"] = "target"
+        await query.answer()
+        await query.edit_message_text(text_targets(), reply_markup=kb_targets(), parse_mode=HTML)
+        return
+
+    if action.startswith("t_"):
+        target_key = action[2:]
+        if target_key not in TARGETS:
+            await query.answer("Такой цели нет", show_alert=True)
+            return
+        if not has_access(user.id):
+            await query.answer()
+            await query.edit_message_text(
+                "🔒 Нужна подписка.\n\n" + await text_shop(rate),
+                reply_markup=kb_plans(rate),
+                parse_mode=HTML,
+            )
+            return
+        context.user_data["target"] = target_key
+        context.user_data["step"] = "method"
+        await query.answer()
+        await query.edit_message_text(
+            text_methods(target_key), reply_markup=kb_methods(), parse_mode=HTML
+        )
+        return
+
+    if action == "profile":
+        await query.answer()
+        await query.edit_message_text(
+            text_profile(user, rate), reply_markup=kb_profile(), parse_mode=HTML
+        )
+        return
+
+    if action == "about":
+        await query.answer()
+        await query.edit_message_text(
+            text_about(), reply_markup=kb_back_to("m:menu"), parse_mode=HTML
+        )
+        return
+
+    if action == "shop":
+        await query.answer()
+        await query.edit_message_text(
+            await text_shop(rate), reply_markup=kb_plans(rate), parse_mode=HTML
+        )
+        return
+
+    await query.answer()
+
+
+async def show_method(query, context, key: str) -> None:
+    if key not in METHODS:
+        await query.answer("Такого метода нет", show_alert=True)
+        return
+    target_key = context.user_data.get("target", "page")
+    context.user_data.clear()
+    context.user_data.update(
+        {"step": "url", "method": key, "url": "", "details": "", "target": target_key}
+    )
+    await query.answer()
+    await query.edit_message_text(
+        text_method(key, target_key),
+        reply_markup=kb_back_to("m:methods", "‹ К причинам"),
+        parse_mode=HTML,
+    )
+
+
+async def on_flow(query, context, action: str) -> None:
+    if action == "cancel":
+        context.user_data.clear()
+        await query.answer("Отменено")
+        await query.edit_message_text(
+            "Отменено.", reply_markup=kb_back_to("m:menu", "‹ В меню")
+        )
+        return
+
+    if action == "skip":
+        if context.user_data.get("step") != "details":
+            await query.answer()
+            return
+        context.user_data["details"] = ""
+        context.user_data["step"] = "confirm"
+        await query.answer()
+        await query.edit_message_text(
+            text_preview(
+                context.user_data["method"],
+                context.user_data.get("url", ""),
+                "",
+                context.user_data.get("target", "page"),
+            ),
+            reply_markup=kb_confirm(),
+            parse_mode=HTML,
+        )
+        return
+
+    if action == "send":
+        await do_send(query, context)
+        return
+
+    await query.answer()
+
+
+def text_log(
+    method_key: str, url: str, sent: int, total: int, target_key: str = "page"
+) -> str:
+    now = time.strftime("%H:%M")
+    return (
+        "🧾 <b>лог отправки</b>\n\n"
+        f"время · {now}\n"
+        f"объект · {TARGETS.get(target_key, TARGETS['page'])['emoji']} "
+        f"{TARGETS.get(target_key, TARGETS['page'])['label']}\n"
+        f"причина · {METHODS[method_key]['label']}\n"
+        f"ссылка · <code>{url}</code>\n"
+        f"письма · <b>{sent}</b> из {total}\n"
+        "статус · в очереди"
+    )
+
+
+async def do_send(query, context) -> None:
+    data = context.user_data
+    method_key = data.get("method")
+    url = data.get("url", "")
+    if method_key not in METHODS or not url:
+        await query.answer("Данные потерялись, начни заново", show_alert=True)
+        return
+
+    uid = query.from_user.id
+    store = DATA["users"].setdefault(str(uid), {})
+    last = float(store.get("last_sent", 0) or 0)
+    wait = COOLDOWN - (time.time() - last)
+    if wait > 0:
+        await query.answer(f"Подожди {int(wait) + 1} с перед следующей жалобой", show_alert=True)
+        return
+    if not accounts():
+        await query.answer("Ящики не настроены: EMAIL_1/EMAIL_PASS_1 в окружении", show_alert=True)
+        return
+
+    target_key = data.get("target", "page")
+    subject, body = build_letter(
+        method_key, url, data.get("details", ""), target_key
+    )
+    await query.answer("Отправляю…")
+    await query.edit_message_text("⏳ Отправляю жалобу…")
+    sent, errors = await asyncio.to_thread(send_letters, subject, body)
+
+    if sent:
+        store["last_sent"] = time.time()
+        bump_reports(uid, method_key)
+        total = len(accounts())
+        context.user_data.clear()
+        await query.edit_message_text(
+            text_log(method_key, url, sent, total, target_key),
+            reply_markup=kb_after_send(),
+            parse_mode=HTML,
+        )
+        return
+
+    reason = errors[0] if errors else "неизвестная ошибка"
+    await query.edit_message_text(
+        "⚠️ <b>Не отправилось</b>\n\n"
+        f"причина — <i>{reason}</i>\n\n"
+        f"Если пароль приложения отозван — его надо перевыпустить. "
+        f"Руками: {SUPPORT}",
+        reply_markup=kb_back_to("m:menu", "‹ В меню"),
+        parse_mode=HTML,
+    )
+    store["last_sent"] = 0
+
+
+# ---------- оплата ----------
+async def on_buy(query, context, code: str) -> None:
+    plan = PLANS.get(code)
+    if plan is None:
+        await query.answer("Такого тарифа нет", show_alert=True)
+        return
+    if not XROCKET_TOKEN:
+        await query.answer(
+            "Оплата не подключена: нет XROCKET_TOKEN", show_alert=True
+        )
+        return
+    rate = await usd_rate()
+    usd = usd_of(plan["rub"], rate)
+    await query.answer("Создаю счёт…")
+    link, inv_id, err = await xr_create(query.from_user.id, code, usd, plan["label"])
+    if err:
+        await query.edit_message_text(
+            "⚠️ <b>Счёт не создался</b>\n\n"
+            f"<i>{err[:300]}</i>\n\n"
+            f"Напиши {SUPPORT}, выдам вручную.",
+            reply_markup=kb_back_to("m:shop", "‹ В магазин"),
+            parse_mode=HTML,
+        )
+        return
+    payment_add(query.from_user.id, code, plan["rub"], usd, inv_id, link)
+    await query.edit_message_text(
+        "🧾 <b>Счёт готов</b>\n\n"
+        f"тариф — <b>{plan['label']}</b>\n"
+        f"к оплате — <b>{rub_str(plan['rub'])}</b> · ${usd:.2f} в {XR_CURRENCY}\n"
+        f"счёт живёт 24 часа\n\n"
+        "<i>Оплати и нажми «Я оплатил» — подписка включится сама.</i>",
+        reply_markup=kb_invoice(link, inv_id),
+        parse_mode=HTML,
+    )
+
+
+async def activate(bot, item: dict) -> int:
+    """Закрывает платёж и включает подписку. Возвращает дату окончания."""
+    item["status"] = "paid"
+    item["paid_at"] = int(time.time())
+    if item["plan"] == DONATE_CODE:
+        item["sub_until"] = 0
+        save_data()
+        try:
+            await bot.send_message(
+                int(item["uid"]),
+                "❤️ <b>Спасибо за поддержку</b>\n\n"
+                f"получено — <b>${float(item.get('usd', 0)):.2f}</b>",
+                parse_mode=HTML,
+            )
+        except Exception:
+            pass
+        for admin in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin,
+                    f"❤️ донат · ${float(item.get('usd', 0)):.2f} · id <code>{item['uid']}</code>",
+                    parse_mode=HTML,
+                )
+            except Exception:
+                pass
+        return 0
+    until = grant(int(item["uid"]), str(item["plan"]))
+    item["sub_until"] = until
+    save_data()
+    plan = PLANS.get(item["plan"], {})
+    until_str = "бессрочно" if until > FOREVER_TS - 86400 else time.strftime(
+        "%d.%m.%Y", time.localtime(until)
+    )
+    try:
+        await bot.send_message(
+            int(item["uid"]),
+            "🎉 <b>Подписка активна</b>\n\n"
+            f"тариф — <b>{plan.get('label', item['plan'])}</b>\n"
+            f"доступ до — {until_str}",
+            parse_mode=HTML,
+        )
+    except Exception:
+        pass
+    for admin in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin,
+                f"💰 оплата · {plan.get('label')} · {rub_str(int(item['rub']))} · "
+                f"id <code>{item['uid']}</code>",
+                parse_mode=HTML,
+            )
+        except Exception:
+            pass
+    return until
+
+
+async def auto_check_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Раз в минуту проверяет неоплаченные счета и выдаёт подписку сама."""
+    if not XROCKET_TOKEN or not DATA.get("payments"):
+        return
+    now = int(time.time())
+    changed = False
+    for item in list(DATA["payments"]):
+        if item.get("status") != "active":
+            continue
+        if now - int(item.get("at", 0)) > 25 * 3600:
+            item["status"] = "expired"
+            changed = True
+            continue
+        status, err = await xr_status(int(item.get("invoice") or 0))
+        if err or status not in PAID_STATES:
+            continue
+        await activate(context.bot, item)
+        changed = True
+    if changed:
+        save_data()
+
+
+async def on_check(query, context, raw_id: str) -> None:
+    try:
+        inv_id = int(raw_id)
+    except ValueError:
+        await query.answer("Кривой номер счёта", show_alert=True)
+        return
+    item = payment_find_invoice(inv_id)
+    if item is None:
+        await query.answer("Счёт не найден", show_alert=True)
+        return
+    if item.get("status") == "paid":
+        await query.answer("Уже оплачен", show_alert=True)
+        return
+    await query.answer("Проверяю…")
+    status, err = await xr_status(inv_id)
+    if err:
+        await query.answer(f"Не смог проверить: {err[:100]}", show_alert=True)
+        return
+    if status != "paid":
+        await query.answer(f"Статус: {status or 'неизвестен'}. Ещё не оплачен.", show_alert=True)
+        return
+    await activate(context.bot, item)
+    if item["plan"] == DONATE_CODE:
+        await query.edit_message_text(
+            "❤️ <b>Чек закрыт</b>\n\n"
+            f"получено — <b>${float(item.get('usd', 0)):.2f}</b>\n\n"
+            "<i>Спасибо, что помогаешь проекту.</i>",
+            reply_markup=kb_back_to("m:menu", "‹ В меню"),
+            parse_mode=HTML,
+        )
+        return
+    plan = PLANS.get(item["plan"], {})
+    until_str = "бессрочно" if int(item.get("sub_until", 0)) > FOREVER_TS - 86400 else (
+        time.strftime("%d.%m.%Y", time.localtime(int(item.get("sub_until", 0))))
+    )
+    await query.edit_message_text(
+        "🎉 <b>Оплата получена</b>\n\n"
+        f"тариф — <b>{plan.get('label', item['plan'])}</b>\n"
+        f"доступ до — {until_str}\n\n"
+        "<i>Спасибо. Жалобы можно отправлять прямо сейчас.</i>",
+        reply_markup=kb_after_send(),
+        parse_mode=HTML,
+    )
+
+
+# ---------- админ ----------
+async def on_admin(query, context, action: str) -> None:
+    rate = await usd_rate()
+    if action == "stats":
+        await query.answer()
+        await query.edit_message_text(
+            admin_home(rate), reply_markup=kb_admin(), parse_mode=HTML
+        )
+        return
+
+    if action == "users":
+        await query.answer()
+        users = sorted(DATA["users"].values(), key=lambda u: -int(u.get("last_at", 0) or 0))
+        lines = ["👥 <b>Пользователи</b>", ""]
+        now = time.time()
+        for rec in users[:20]:
+            mark = "🟢" if int(rec.get("sub_until", 0)) > now else "⚪️"
+            name = rec.get("name") or "без имени"
+            lines.append(
+                f"{mark} <code>{rec.get('id')}</code> · {name} · "
+                f"жалоб {int(rec.get('reports', 0))}"
+            )
+        if not users:
+            lines.append("<i>пока пусто</i>")
+        lines.append(f"\nвсего: {len(users)}")
+        await query.edit_message_text(
+            "\n".join(lines), reply_markup=kb_back_to("a:stats", "‹ В админку"), parse_mode=HTML
+        )
+        return
+
+    if action == "pays":
+        await query.answer()
+        pays = DATA["payments"][-10:][::-1]
+        lines = ["🧾 <b>Последние платежи</b>", ""]
+        for item in pays:
+            when = time.strftime("%d.%m %H:%M", time.localtime(int(item.get("at", 0))))
+            lines.append(
+                f"{when} · <code>{item.get('uid')}</code> · "
+                f"{plan_label(str(item.get('plan')))} · "
+                f"{rub_str(int(item.get('rub', 0)))} · {item.get('status')}"
+            )
+        if not pays:
+            lines.append("<i>платежей ещё не было</i>")
+        total = sum(int(p.get("rub", 0)) for p in DATA["payments"] if p.get("status") == "paid")
+        lines.append(f"\nоплачено всего: <b>{rub_str(total)}</b>")
+        await query.edit_message_text(
+            "\n".join(lines), reply_markup=kb_back_to("a:stats", "‹ В админку"), parse_mode=HTML
+        )
+        return
+
+    if action in ("grant", "revoke", "cast"):
+        context.user_data["admin"] = {"step": action}
+        await query.answer()
+        if action == "grant":
+            hint = "Пришли: <code>ID тариф</code>\nтарифы: " + ", ".join(PLAN_ORDER)
+        elif action == "revoke":
+            hint = "Пришли ID пользователя, у кого забрать подписку."
+        else:
+            hint = "Пришли текст рассылки одним сообщением."
+        await query.edit_message_text(
+            f"✍️ <b>Жду ввод</b>\n\n{hint}",
+            reply_markup=kb_back_to("a:stats", "‹ Отмена"),
+            parse_mode=HTML,
+        )
+        return
+
+    await query.answer()
+
+
+async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Обрабатывает ввод админа. True — сообщение съедено."""
+    uid = update.effective_user.id
+    if uid not in ADMIN_IDS:
+        return False
+    pending = context.user_data.get("admin")
+    if not isinstance(pending, dict):
+        return False
+    step = pending.get("step")
+    text = (update.message.text or "").strip()
+    context.user_data.pop("admin", None)
+
+    if step == "grant":
+        parts = text.split()
+        if len(parts) != 2 or not TG_ID_RE.match(parts[0]) or parts[1] not in PLANS:
+            await update.message.reply_text(
+                "Не понял. Формат: <code>436426811 month</code>\nтарифы: "
+                + ", ".join(PLAN_ORDER),
+                parse_mode=HTML,
+            )
+            return True
+        target, code = int(parts[0]), parts[1]
+        until = grant(target, code)
+        await update.message.reply_text(
+            f"🎁 выдал <code>{target}</code> тариф <b>{PLANS[code]['label']}</b> "
+            f"до {time.strftime('%d.%m.%Y', time.localtime(until))}",
+            parse_mode=HTML,
+        )
+        try:
+            await context.bot.send_message(
+                target,
+                f"🎁 Тебе выдали подписку <b>{PLANS[code]['label']}</b>.\n"
+                f"Доступ до {time.strftime('%d.%m.%Y', time.localtime(until))}.",
+                parse_mode=HTML,
+            )
+        except Exception:
+            pass
+        return True
+
+    if step == "revoke":
+        if not TG_ID_RE.match(text):
+            await update.message.reply_text("Нужен числовой ID.")
+            return True
+        revoke(int(text))
+        await update.message.reply_text(f"🚫 забрал подписку у <code>{text}</code>", parse_mode=HTML)
+        return True
+
+    if step == "cast":
+        if len(text) < 3:
+            await update.message.reply_text("Слишком коротко.")
+            return True
+        sent = failed = 0
+        for key in list(DATA["users"].keys()):
+            try:
+                await context.bot.send_message(int(key), text, parse_mode=HTML)
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+        await update.message.reply_text(f"📣 ушло: {sent}, не дошло: {failed}")
+        return True
+
+    return False
+
+
+# ---------- тексты ----------
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await admin_text(update, context):
+        return
+
+    text = (update.message.text or "").strip()
+    step = context.user_data.get("step")
+
+    if step == "url":
+        url, error = validate_url(text, context.user_data.get("target", ""))
+        if error:
+            await update.message.reply_text(f"⚠️ {error}")
+            return
+        context.user_data["url"] = url
+        context.user_data["step"] = "details"
+        key = context.user_data.get("method", "other")
+        await update.message.reply_text(
+            text_details(key), reply_markup=kb_details(key), parse_mode=HTML
+        )
+        return
+
+    if step == "details":
+        context.user_data["details"] = text[:600]
+        context.user_data["step"] = "confirm"
+        key = context.user_data.get("method", "other")
+        await update.message.reply_text(
+            text_preview(
+                key, context.user_data.get("url", ""), text,
+                context.user_data.get("target", "page"),
+            ),
+            reply_markup=kb_confirm(),
+            parse_mode=HTML,
+        )
+        return
+
+    if step == "donate":
+        raw = text.replace("$", "").replace(",", ".").replace(" ", "").strip()
+        try:
+            usd = round(float(raw), 2)
+        except ValueError:
+            await update.message.reply_text("Нужна сумма числом: например 5 или 2.5")
+            return
+        if not (DONATE_MIN <= usd <= DONATE_MAX):
+            await update.message.reply_text(f"Сумма от ${DONATE_MIN:g} до ${DONATE_MAX:g}")
+            return
+        context.user_data["step"] = "menu"
+        rate = await usd_rate()
+        link, inv_id, err = await make_donate(update.effective_user.id, usd, rate)
+        if err:
+            await update.message.reply_text(
+                "⚠️ <b>Чек не создался</b>\n\n" f"<i>{err[:300]}</i>", parse_mode=HTML
+            )
+            return
+        await update.message.reply_text(
+            text_donate_invoice(usd, rate),
+            reply_markup=kb_invoice(link, inv_id, "m:profile", "‹ В профиль"),
+            parse_mode=HTML,
+        )
+        return
+
+    await update.message.reply_text(
+        "Не понял. /start — меню, /admin — админка."
+    )
+
+
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN не задан")
+    load_data()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(auto_check_job, interval=60, first=20)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
